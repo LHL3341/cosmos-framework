@@ -98,8 +98,14 @@ class OmniMoTModel(ImaginaireModel):
         self.tensor_kwargs_fp32 = {"device": DEVICE, "dtype": torch.float32}
         log.warning(f"OmniMoTModel: precision {self.precision}")
 
-        # Disable TF32 for CUDA matrix multiplications since this may impact model quality.
-        torch.backends.cudnn.allow_tf32 = torch.backends.cuda.matmul.allow_tf32 = False
+        # TF32 for CUDA matmul / cuDNN. Enabled by default as a throughput win:
+        # compute runs in bf16 with fp32 master weights (fsdp_master_dtype="float32")
+        # and numerically sensitive paths manage their own precision, so TF32 does not
+        # move the loss in practice (mirrors the mozbrain WAM finding that *disabling*
+        # TF32 caused a large step-time regression with bit-identical loss). Set
+        # model.config.allow_tf32=False to restore the previous fp32-matmul behavior.
+        allow_tf32 = getattr(self.config, "allow_tf32", True)
+        torch.backends.cudnn.allow_tf32 = torch.backends.cuda.matmul.allow_tf32 = allow_tf32
 
     def set_up_data_key(self) -> None:
         self.input_video_key = self.config.input_video_key  # by default it is video key for Video diffusion model
