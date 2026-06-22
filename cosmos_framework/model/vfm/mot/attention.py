@@ -86,6 +86,7 @@ def two_way_attention(
     packed_query_states: FactoredSequencePack | JointSequencePack,
     packed_key_states: FactoredSequencePack | JointSequencePack,
     packed_value_states: FactoredSequencePack | JointSequencePack,
+    memory_value: MemoryValue | None = None,
 ):
     """
     Performs two-way attention with causal and full attention.
@@ -97,6 +98,35 @@ def two_way_attention(
     full_q, full_q_offsets = get_full_only_seq(packed_query_states)
 
     sample_offsets = packed_query_states["sample_offsets"]
+
+    cached_und_k = getattr(memory_value, "und_k", None) if memory_value is not None else None
+    cached_und_v = getattr(memory_value, "und_v", None) if memory_value is not None else None
+    if cached_und_k is not None and cached_und_v is not None:
+        full_k, _ = get_full_only_seq(packed_key_states)
+        full_v, _ = get_full_only_seq(packed_value_states)
+        if cached_und_k.ndim != 4 or cached_und_v.ndim != 4 or cached_und_k.shape[0] != 1:
+            raise ValueError("two_way text KV cache currently expects cached und K/V shaped [1,T,H,D].")
+        if full_q_offsets.numel() != 2:
+            raise ValueError("two_way text KV cache currently supports one sample per forward.")
+
+        cached_und_k = cached_und_k.squeeze(0)
+        cached_und_v = cached_und_v.squeeze(0)
+        kv = torch.cat([cached_und_k, full_k], dim=0)
+        vv = torch.cat([cached_und_v, full_v], dim=0)
+        kv_offsets = torch.tensor([0, kv.shape[0]], dtype=full_q_offsets.dtype, device=full_q_offsets.device)
+
+        full_res = attention(
+            full_q.unsqueeze(0),
+            kv.unsqueeze(0),
+            vv.unsqueeze(0),
+            cumulative_seqlen_Q=full_q_offsets,
+            cumulative_seqlen_KV=kv_offsets,
+            max_seqlen_Q=packed_query_states["max_full_len"],
+            max_seqlen_KV=int(kv.shape[0]),
+        )
+        full_out = full_res.squeeze(0).flatten(-2, -1)
+        causal_out = full_out.new_empty((0, full_out.shape[-1]))
+        return from_mode_splits(causal_out, full_out, packed_query_states)
 
     use_dont_care_mask = causal_q_offsets is causal_k_offsets
 
@@ -304,8 +334,9 @@ def dispatch_attention(
     natten_metadata: dict | None = None,
     memory_value: MemoryValue | None = None,
 ) -> tuple[FactoredSequencePack | JointSequencePack, KVToStore | None]:
-    assert memory_value is None, "Base dispatch_attention does not handle MemoryValue"
     if isinstance(attention_mask, SplitInfo) and attention_mask.is_three_way:
+        if memory_value is not None:
+            raise ValueError("Base dispatch_attention only supports MemoryValue for two_way attention.")
         output = three_way_attention(
             packed_query_states,
             packed_key_states,
@@ -314,8 +345,10 @@ def dispatch_attention(
             attention_meta=attention_mask,
         )
     elif isinstance(attention_mask, SplitInfo):
-        output = two_way_attention(packed_query_states, packed_key_states, packed_value_states)
+        output = two_way_attention(packed_query_states, packed_key_states, packed_value_states, memory_value)
     else:
+        if memory_value is not None:
+            raise ValueError("Base dispatch_attention only supports MemoryValue for two_way attention.")
         output = block_flex_attention(packed_query_states, packed_key_states, packed_value_states, attention_mask)
     return output, None
 
